@@ -111,13 +111,27 @@ sar_val_transform = transforms.Compose([
 #  TRAINING DATASET — Paired EO + SAR
 # ─────────────────────────────────────────────
 
+# Competition-required class ordering (must NOT be sorted alphabetically)
+COMPETITION_CLASS_TO_IDX = {
+    "sedan":                  0,
+    "SUV":                    1,
+    "pickup_truck":           2,
+    "van":                    3,
+    "box_truck":              4,
+    "motorcycle":             5,
+    "flatbed_truck":          6,
+    "bus":                    7,
+    "pickup_truck_w_trailer": 8,
+    "semi_w_trailer":         9,
+}
+
 def get_class_to_idx(root):
-    """Map class folder names → integer indices (sorted for consistency)."""
-    classes = sorted([
-        d for d in os.listdir(root)
-        if os.path.isdir(os.path.join(root, d))
-    ])
-    return {cls: i for i, cls in enumerate(classes)}
+    """Map class folder names → competition integer indices (fixed, not alphabetical)."""
+    found = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    unknown = [c for c in found if c not in COMPETITION_CLASS_TO_IDX]
+    if unknown:
+        raise ValueError(f"Unknown class folders not in competition mapping: {unknown}")
+    return COMPETITION_CLASS_TO_IDX
 
 
 class EOSARDataset(Dataset):

@@ -87,7 +87,7 @@ CONFIG = {
     "train_eo_root":  "C:\\train\\EO_Train",
     "val_sar_root":   "D:\\RWoodzell Classification Challenge\\val",
     "val_csv_path":   "D:\\RWoodzell Classification Challenge\\val\\validation_reference.csv",
-    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\checkpoints",
+    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\checkpointsSecondTry",
 
     # --- Training (Optimized for 2x RTX 6000 Ada = 95GB VRAM) ---
     "epochs":        75,
