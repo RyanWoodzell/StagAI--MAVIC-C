@@ -31,10 +31,6 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 
-# BUG FIXED: import names updated to match your actual filenames and class names
-# preprocessing.py  → build_dataloaders
-# encoding.py       → ModalityEncoders (was ModalityEncoder, missing the 's')
-# fusionModel.py    → FusionModel
 from preprocessing import build_dataloaders
 from encoding import ModalityEncoders
 from fusionModel import FusionModel
@@ -55,17 +51,28 @@ class MAVICModel(nn.Module):
     def __init__(
         self,
         num_classes:        int   = 10,
-        freeze_eo_backbone: bool  = False,   # FIXED: was missing from __init__
+        freeze_eo_backbone: bool  = False,   
         drop_prob:          float = 0.25,
         label_smooth:       float = 0.1,
+        # SARCLIP INTEGRATION
+        freeze_sar_backbone: bool = True,
+        sar_weights_path:    str  = '',
     ):
         super().__init__()
         # BUG FIXED: ModalityEncoder → ModalityEncoders, and passes freeze_eo_backbone
-        self.encoders     = ModalityEncoders(freeze_eo_backbone=freeze_eo_backbone)
+        # SARCLIP INTEGRATION: pass SAR weights path and freeze flag
+        self.encoders     = ModalityEncoders(
+            freeze_eo_backbone  = freeze_eo_backbone,
+            freeze_sar_backbone = freeze_sar_backbone,
+            sar_weights_path    = sar_weights_path,
+        )
+        # SARCLIP INTEGRATION: sar_in_dim=768 (ViT-L-14) vs eo_in_dim=1280 (EfficientNet)
         self.fusion_model = FusionModel(
             num_classes  = num_classes,
             drop_prob    = drop_prob,
             label_smooth = label_smooth,
+            eo_in_dim    = self.encoders.eo_feature_dim,
+            sar_in_dim   = self.encoders.sar_feature_dim,
         )
 
     def forward(self, eo: torch.Tensor, sar: torch.Tensor):
@@ -87,12 +94,11 @@ CONFIG = {
     "train_eo_root":  "C:\\train\\EO_Train",
     "val_sar_root":   "D:\\RWoodzell Classification Challenge\\val",
     "val_csv_path":   "D:\\RWoodzell Classification Challenge\\val\\validation_reference.csv",
-    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\checkpointsSecondTry",
+    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\#FinalTryModels",
 
     # --- Training (Optimized for 2x RTX 6000 Ada = 95GB VRAM) ---
     "epochs":        75,
-    "batch_size":    512,           # Doubled: 95GB VRAM handles this easily
-    
+    "batch_size":    512,           
     # Optimized for NVMe SSD; reduce to 4 if still on HDD
     "num_workers":   16,            # 64 cores - leave room for GPU threads
     "prefetch_factor": 4,           # Prefetch batches per worker
@@ -106,9 +112,13 @@ CONFIG = {
     "label_smooth":       0.1,
     "freeze_eo_backbone": False,
 
+    # SARCLIP INTEGRATION
+    "freeze_sar_backbone": True,
+    "sar_weights_path":    r"D:\RWoodzell Classification Challenge\BestModelTryAgain\StagAI--MAVIC-C\sar_clip\model_configs\ViT-L-14\models--BiliSakura--SARCLIP-ViT-L-14\snapshots\fd6c03457e79e65285acf0045f63ce6bc485650f\model.safetensors",
+    "sar_in_dim":          768,
+    "sar_unfreeze_epoch":   65,   
+
     # --- Hardware (RTX 6000 Ada Optimizations) ---
-    # NOTE: DataParallel is BROKEN on Windows (no NCCL support).
-    #       Single GPU (51.5 GB) is more than enough for batch 512.
     "use_multi_gpu":   False,
     "use_compile":     False,       # Disabled: causes graph breaks with this model
     "use_tf32":        True,        # TF32 tensor cores on Ada
@@ -213,9 +223,12 @@ def train(config: dict):
     # --- Model ---
     model = MAVICModel(
         num_classes        = num_classes,
-        freeze_eo_backbone = config["freeze_eo_backbone"],   # BUG FIXED: now passed in
+        freeze_eo_backbone = config["freeze_eo_backbone"],  
         drop_prob          = config["drop_prob"],
         label_smooth       = config["label_smooth"],
+        # SARCLIP INTEGRATION
+        freeze_sar_backbone = config["freeze_sar_backbone"],
+        sar_weights_path    = config["sar_weights_path"],
     )
 
     if use_multi_gpu:
@@ -268,21 +281,47 @@ def train(config: dict):
     best_ckpt_path = os.path.join(config["checkpoint_dir"], "best_model.pth")
 
     # --- Training Loop ---
-    print("=" * 70)
-    print(f"{'Epoch':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
+    print("=" * 100)
+    print(f"{'Epoch':>6} | {'Loss(EO+SAR)':>12} | {'Loss(SAR)':>9} | {'Acc(EO+SAR)':>11} | {'Acc(SAR)':>8} | "
           f"{'Val Loss':>8} | {'Val Acc':>7} | {'LR':>8}")
-    print("=" * 70)
+    print("=" * 100)
 
     for epoch in range(1, config["epochs"] + 1):
+
+        # ─────────────────────────────────────────────
+        # SARCLIP BACKBONE FREEZE SCHEDULE
+        # Frozen for first N epochs, then unfreeze for fine-tuning
+        # ─────────────────────────────────────────────
+        unfreeze_epoch = config.get("sar_unfreeze_epoch", 11)
+
+        if epoch == unfreeze_epoch:
+            m = model.module if use_multi_gpu else model
+            for param in m.encoders.sar_encoder.backbone.parameters():
+                param.requires_grad = True
+            print(f"\n🔓 Epoch {epoch}: SARCLIP backbone unfrozen for fine-tuning")
+
+            # Reset optimizer so newly unfrozen params get proper learning rate
+            optimizer = AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr           = config["learning_rate"] * 0.1,
+                weight_decay = config["weight_decay"],
+                fused        = torch.cuda.is_available(),
+            )
+            print(f"   Optimizer reset with fine-tune lr: {config['learning_rate'] * 0.1:.2e}")
 
         # --- Train ---
         model.train()
         total_loss = total_correct = total_samples = 0
+        # EO-present tracking (eo_dropped == 0)
+        eo_loss = eo_correct = eo_samples = 0
+        # SAR-only tracking (eo_dropped == 1)
+        sar_loss = sar_correct = sar_samples = 0
 
         for batch in train_loader:
-            eo     = batch['eo'].to(device,   non_blocking=True)
-            sar    = batch['sar'].to(device,   non_blocking=True)
-            labels = batch['label'].to(device,  non_blocking=True)
+            eo         = batch['eo'].to(device,         non_blocking=True)
+            sar        = batch['sar'].to(device,         non_blocking=True)
+            labels     = batch['label'].to(device,       non_blocking=True)
+            eo_dropped = batch['eo_dropped'].to(device,  non_blocking=True)
 
             optimizer.zero_grad()
 
@@ -307,8 +346,24 @@ def train(config: dict):
             total_samples += labels.size(0)
             total_loss    += loss.item() * labels.size(0)
 
+            # Split stats for EO-present vs SAR-only batches
+            eo_mask  = (eo_dropped == 0)   # samples where EO was kept
+            sar_mask = (eo_dropped == 1)   # samples where EO was zeroed
+            if eo_mask.sum() > 0:
+                eo_loss    += loss.item() * eo_mask.sum().item()
+                eo_correct += (preds[eo_mask] == labels[eo_mask]).sum().item()
+                eo_samples += eo_mask.sum().item()
+            if sar_mask.sum() > 0:
+                sar_loss    += loss.item() * sar_mask.sum().item()
+                sar_correct += (preds[sar_mask] == labels[sar_mask]).sum().item()
+                sar_samples += sar_mask.sum().item()
+
         train_loss = total_loss    / total_samples
         train_acc  = total_correct / total_samples
+        eo_loss_avg  = eo_loss  / eo_samples  if eo_samples  > 0 else float('nan')
+        sar_loss_avg = sar_loss / sar_samples if sar_samples > 0 else float('nan')
+        eo_acc_avg   = eo_correct  / eo_samples  if eo_samples  > 0 else float('nan')
+        sar_acc_avg  = sar_correct / sar_samples if sar_samples > 0 else float('nan')
 
         # --- Validate ---
         val_loss, val_acc = validate(model, val_loader, device, use_multi_gpu)
@@ -318,26 +373,37 @@ def train(config: dict):
 
         print(
             f"{epoch:>6} | "
-            f"{train_loss:>10.4f} | "
-            f"{train_acc*100:>8.2f}% | "
+            f"{eo_loss_avg:>12.4f} | "
+            f"{sar_loss_avg:>9.4f} | "
+            f"{eo_acc_avg*100:>10.2f}% | "
+            f"{sar_acc_avg*100:>7.2f}% | "
             f"{val_loss:>8.4f} | "
             f"{val_acc*100:>6.2f}% | "
             f"{current_lr:>8.2e}"
         )
 
-        # Save best checkpoint — unwrap DataParallel before saving
+        # Unwrap DataParallel before saving
+        state = model.module if use_multi_gpu else model
+        ckpt = {
+            "epoch":        epoch,
+            "model_state":  state.state_dict(),
+            "optimizer":    optimizer.state_dict(),
+            "scheduler":    scheduler.state_dict(),
+            "val_acc":      val_acc,
+            "class_to_idx": class_to_idx,
+        }
+
+        # Save best checkpoint
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            state = model.module if use_multi_gpu else model
-            torch.save({
-                "epoch":        epoch,
-                "model_state":  state.state_dict(),
-                "optimizer":    optimizer.state_dict(),
-                "scheduler":    scheduler.state_dict(),
-                "val_acc":      val_acc,
-                "class_to_idx": class_to_idx,
-            }, best_ckpt_path)
+            torch.save(ckpt, best_ckpt_path)
             print(f"         ✅ New best saved (val acc: {val_acc*100:.2f}%)")
+
+        # Save every 5 epochs
+        if epoch % 5 == 0:
+            epoch_ckpt_path = os.path.join(config["checkpoint_dir"], f"model_epoch_{epoch}.pth")
+            torch.save(ckpt, epoch_ckpt_path)
+            print(f"         💾 Epoch {epoch} checkpoint saved")
 
     print("=" * 70)
     print(f"Training complete. Best val accuracy: {best_val_acc*100:.2f}%")

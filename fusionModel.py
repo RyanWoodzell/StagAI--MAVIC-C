@@ -11,6 +11,34 @@ Step 6: Classification head [B,512] → [B,num_classes]
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ─────────────────────────────────────────────
+#  FOCAL LOSS
+# ─────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss — penalises easy examples less so the model is forced
+    to learn the rare classes instead of always predicting sedan.
+    FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+    gamma=2 is the standard value; raise to 3–4 if minority classes
+    still aren't being predicted.
+    """
+    def __init__(self, gamma: float = 2.0, label_smooth: float = 0.1):
+        super().__init__()
+        self.gamma        = gamma
+        self.label_smooth = label_smooth
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(
+            logits, labels,
+            label_smoothing=self.label_smooth,
+            reduction='none',
+        )
+        pt = torch.exp(-ce)                          # probability of correct class
+        return ((1.0 - pt) ** self.gamma * ce).mean()
 
 
 # ─────────────────────────────────────────────
@@ -131,7 +159,7 @@ class ClassificationHead(nn.Module):
             nn.Dropout(p=dropout),
             nn.Linear(mid_dim, num_classes),
         )
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smooth)
+        self.criterion = FocalLoss(gamma=2.0, label_smooth=label_smooth)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(x)
@@ -168,7 +196,7 @@ class FusionModel(nn.Module):
         head_dropout: float = 0.4,
         label_smooth: float = 0.1,
         eo_in_dim:    int   = 1280,
-        sar_in_dim:   int   = 1280,
+        sar_in_dim:   int   = 768,    # SARCLIP INTEGRATION: ViT-L-14 outputs 768-dim
     ):
         super().__init__()
 

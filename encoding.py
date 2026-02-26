@@ -15,7 +15,36 @@ NOTE: Feature dim is 1280 (not 512 like ResNet-18).
 
 import torch
 import torch.nn as nn
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from torchvision.models import (
+    efficientnet_b0, EfficientNet_B0_Weights,
+    efficientnet_b1, EfficientNet_B1_Weights,
+    efficientnet_b2, EfficientNet_B2_Weights,
+    efficientnet_b3, EfficientNet_B3_Weights,
+)
+
+# SARCLIP INTEGRATION
+import sys
+sys.path.insert(0, r'D:\RWoodzell Classification Challenge\BestModelTryAgain\SARCLIP')
+import open_clip
+from safetensors.torch import load_file
+
+
+# Supported backbones and their feature dimensions
+BACKBONE_REGISTRY = {
+    "efficientnet_b0": (efficientnet_b0, EfficientNet_B0_Weights.IMAGENET1K_V1, 1280),
+    "efficientnet_b1": (efficientnet_b1, EfficientNet_B1_Weights.IMAGENET1K_V1, 1280),
+    "efficientnet_b2": (efficientnet_b2, EfficientNet_B2_Weights.IMAGENET1K_V1, 1408),
+    "efficientnet_b3": (efficientnet_b3, EfficientNet_B3_Weights.IMAGENET1K_V1, 1536),
+}
+
+
+def _build_efficientnet(backbone_name: str):
+    """Load pretrained EfficientNet, strip classifier, return (features, avgpool, feat_dim)."""
+    if backbone_name not in BACKBONE_REGISTRY:
+        raise ValueError(f"Unknown backbone '{backbone_name}'. Choose from: {list(BACKBONE_REGISTRY)}")
+    model_fn, weights, feat_dim = BACKBONE_REGISTRY[backbone_name]
+    net = model_fn(weights=weights)
+    return net.features, net.avgpool, feat_dim
 
 
 # ─────────────────────────────────────────────
@@ -28,51 +57,21 @@ from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 class EOEncoder(nn.Module):
     """
     EO (Electro-Optical / RGB) encoder.
-
-    Uses EfficientNet-B0 pretrained on ImageNet. The final classifier
-    layer is removed — we only want the 1280-dim feature vector from
-    the adaptive average pool, not class predictions.
-
-    Why EfficientNet over ResNet-18?
-        EfficientNet scales depth, width, and resolution together using
-        a compound coefficient. B0 is the smallest variant but still
-        outperforms ResNet-18 on ImageNet with fewer parameters.
-        Better features = better downstream fusion performance.
-
-    Args:
-        freeze_backbone: If True, freeze all EfficientNet weights and
-                         only train the projection head. Useful when
-                         your dataset is small.
+    Supports EfficientNet-B0 through B3 via the backbone argument.
     """
 
-    def __init__(self, freeze_backbone: bool = False):
+    def __init__(self, freeze_backbone: bool = False, backbone: str = "efficientnet_b0"):
         super().__init__()
-
-        # Load pretrained EfficientNet-B0
-        effnet = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-
-        # EfficientNet architecture:
-        #   effnet.features   → convolutional feature extractor
-        #   effnet.avgpool    → adaptive average pool → [B, 1280, 1, 1]
-        #   effnet.classifier → Linear(1280, 1000)  ← we remove this
-        self.features  = effnet.features
-        self.avgpool   = effnet.avgpool
-        self.feature_dim = 1280
+        self.features, self.avgpool, self.feature_dim = _build_efficientnet(backbone)
 
         if freeze_backbone:
             for param in self.features.parameters():
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: EO image tensor [B, 3, 224, 224]
-        Returns:
-            features: [B, 1280]
-        """
-        x = self.features(x)     # [B, 1280, 7, 7]
-        x = self.avgpool(x)      # [B, 1280, 1, 1]
-        x = x.flatten(1)         # [B, 1280]
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
         return x
 
 
@@ -81,71 +80,104 @@ class EOEncoder(nn.Module):
 # ##############NOT TRAINED FROM SCRATCH ANYMORE. PRETRAINED EFFICIENTNET-B0 WITH ADAPTED 1-CHANNEL INPUT CONV
 # ─────────────────────────────────────────────
 
+# LEGACY: replaced by SARCLIPEncoder
 class SAREncoder(nn.Module):
     """
-    SAR (Synthetic Aperture Radar) encoder.
-
-    Uses EfficientNet-B0 with ImageNet pretrained weights adapted for 
-    1-channel input by averaging the RGB conv weights → grayscale.
-    
-    Why pretrained → adapted?
-        Training from scratch is slow and risky with limited data.
-        ImageNet pretrained weights capture useful low-level features
-        (edges, textures) that transfer well to SAR. Averaging the
-        3-channel conv weights into 1 channel preserves these features
-        while adapting to grayscale input.
-    
-    How we adapt for 1-channel input:
-        1. Load pretrained EfficientNet-B0 (3-channel Conv2d)
-        2. Average RGB weights: [32, 3, 3, 3] → [32, 1, 3, 3]
-        3. Replace first conv with adapted 1-channel conv
+    SAR encoder — pretrained EfficientNet adapted for 1-channel input.
+    Supports B0 through B3 via the backbone argument.
     """
 
-    def __init__(self, use_pretrained_init: bool = True):
+    def __init__(self, use_pretrained_init: bool = True, backbone: str = "efficientnet_b0"):
         super().__init__()
 
-        # Load EfficientNet-B0 WITH pretrained weights for transfer
-        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if use_pretrained_init else None
-        effnet = efficientnet_b0(weights=weights)
+        if backbone not in BACKBONE_REGISTRY:
+            raise ValueError(f"Unknown backbone '{backbone}'. Choose from: {list(BACKBONE_REGISTRY)}")
+        model_fn, weights, feat_dim = BACKBONE_REGISTRY[backbone]
+        effnet = model_fn(weights=weights if use_pretrained_init else None)
 
-        # The first conv layer is nested inside features[0][0]
+        # Adapt first conv layer from 3-channel → 1-channel
         original_conv = effnet.features[0][0]
-
-        # Create new 1-channel conv layer
         new_conv = nn.Conv2d(
             in_channels  = 1,
             out_channels = original_conv.out_channels,
             kernel_size  = original_conv.kernel_size,
             stride       = original_conv.stride,
             padding      = original_conv.padding,
-            bias         = False
+            bias         = False,
         )
-        
-        # Initialize from pretrained: average RGB weights → grayscale
         if use_pretrained_init:
             with torch.no_grad():
-                # original_conv.weight shape: [32, 3, 3, 3] → mean over dim=1 → [32, 1, 3, 3]
                 new_conv.weight = nn.Parameter(
                     original_conv.weight.mean(dim=1, keepdim=True)
                 )
-        
         effnet.features[0][0] = new_conv
 
         self.features    = effnet.features
         self.avgpool     = effnet.avgpool
-        self.feature_dim = 1280
+        self.feature_dim = feat_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: SAR image tensor [B, 1, 224, 224]
-        Returns:
-            features: [B, 1280]
-        """
-        x = self.features(x)     # [B, 1280, 7, 7]
-        x = self.avgpool(x)      # [B, 1280, 1, 1]
-        x = x.flatten(1)         # [B, 1280]
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
         return x
+
+
+# ─────────────────────────────────────────────
+#  SARCLIP INTEGRATION: ViT-L-14 SAR Encoder
+# ─────────────────────────────────────────────
+
+class SARCLIPEncoder(nn.Module):
+    """
+    SAR encoder using pretrained SARCLIP ViT-L-14 weights.
+    Loads HuggingFace .safetensors, remaps keys to open_clip format,
+    and extracts the visual backbone.
+
+    Input:  [B, 1, 224, 224]  (single-channel SAR)
+    Output: [B, 768]          (ViT-L-14 embedding)
+    """
+
+    def __init__(self, weights_path: str, freeze_backbone: bool = True):
+        super().__init__()
+
+    # Create ViT-L-14 architecture (no pretrained weights yet)
+        model, _, _ = open_clip.create_model_and_transforms('ViT-L-14', pretrained=None)
+
+    # Load .safetensors weights from HuggingFace
+        state_dict = load_file(weights_path)
+
+    # Remap HuggingFace keys → open_clip keys
+        remapped = {}
+        for k, v in state_dict.items():
+            if k.startswith('vision_model.'):
+                new_key = k.replace('vision_model.', 'visual.')
+                remapped[new_key] = v
+            elif k == 'logit_scale':
+                remapped[k] = v
+    # Load remapped weights (strict=False: text tower keys will be missing)
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+
+    # ← PRINT STATEMENTS GO HERE, after load_state_dict
+        print(f"✅ SARCLIP ViT-L-14 loaded — missing: {len(missing)}, unexpected: {len(unexpected)}")
+        print(f"   Remapped {len(remapped)} keys from weights file")
+        # Freeze if requested (default: True — SARCLIP is already pretrained)
+
+        self.backbone = model.visual  # ViT-L-14 visual encoder
+        self.feature_dim = 768  # ViT-L-14 outputs 768-dim features
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            print("🔒 SARCLIP backbone frozen")
+
+        self.feature_dim = 768
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expand to 3 channels only if input is single-channel
+        # (SARCLIP transforms already expand to 3ch; legacy transforms don't)
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x = self.backbone(x)
+        return x   # [B, 768]
 
 
 # ─────────────────────────────────────────────
@@ -157,23 +189,33 @@ class ModalityEncoders(nn.Module):
     Wraps both encoders into a single module for clean forward passes.
 
     Args:
-        freeze_eo_backbone: freeze EO EfficientNet weights (default False)
+        freeze_eo_backbone : freeze EO backbone weights (default False)
+        backbone           : which EfficientNet variant to use for both encoders
+                             Options: 'efficientnet_b0' (default), 'b1', 'b2', 'b3'
     """
 
-    def __init__(self, freeze_eo_backbone: bool = False):
+    def __init__(
+        self,
+        freeze_eo_backbone:  bool = False,
+        backbone:            str  = "efficientnet_b0",
+        # SARCLIP INTEGRATION
+        freeze_sar_backbone: bool = True,
+        sar_weights_path:    str  = '',
+    ):
         super().__init__()
-        self.eo_encoder  = EOEncoder(freeze_backbone=freeze_eo_backbone)
-        self.sar_encoder = SAREncoder()
+        self.eo_encoder  = EOEncoder(freeze_backbone=freeze_eo_backbone, backbone=backbone)
+
+        # SARCLIP INTEGRATION: use SARCLIPEncoder instead of EfficientNet SAREncoder
+        self.sar_encoder = SARCLIPEncoder(
+            weights_path     = sar_weights_path,
+            freeze_backbone  = freeze_sar_backbone,
+        )
+
+        self.feature_dim     = self.eo_encoder.feature_dim   # legacy compat
+        self.eo_feature_dim  = self.eo_encoder.feature_dim   # 1280
+        self.sar_feature_dim = self.sar_encoder.feature_dim  # 768
 
     def forward(self, eo: torch.Tensor, sar: torch.Tensor):
-        """
-        Args:
-            eo  : [B, 3, 224, 224]
-            sar : [B, 1, 224, 224]
-        Returns:
-            eo_feat  : [B, 1280]
-            sar_feat : [B, 1280]
-        """
         eo_feat  = self.eo_encoder(eo)
         sar_feat = self.sar_encoder(sar)
         return eo_feat, sar_feat

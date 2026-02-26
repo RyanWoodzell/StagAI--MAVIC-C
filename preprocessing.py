@@ -14,7 +14,7 @@ TWO dataset classes:
 import os
 import torch
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
 
@@ -50,6 +50,18 @@ class SARNormalize:
 
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
         return (img - self.mean) / (self.std + 1e-8)
+
+
+# SARCLIP INTEGRATION
+class ExpandChannels:
+    """
+    Repeats a single-channel tensor to 3 channels.
+    Replaces transforms.Lambda (unpicklable on Windows multiprocessing).
+    Input:  [1, H, W]
+    Output: [3, H, W]
+    """
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        return img.repeat(3, 1, 1)
 
 
 # ─────────────────────────────────────────────
@@ -107,6 +119,33 @@ sar_val_transform = transforms.Compose([
 ])
 
 
+# SARCLIP INTEGRATION — SAR transforms for ViT-L-14 (CLIP normalization, 3-channel)
+sar_clip_train_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.RandomCrop(224),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ToTensor(),
+    SARLogTransform(eps=1e-6),
+    ExpandChannels(),   # [1,H,W] → [3,H,W]
+    transforms.Normalize(
+        mean=(0.48145466, 0.4578275, 0.40821073),
+        std=(0.26862954, 0.26130258, 0.27577711),
+    ),
+])
+
+sar_clip_val_transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    SARLogTransform(eps=1e-6),
+    ExpandChannels(),   # [1,H,W] → [3,H,W]
+    transforms.Normalize(
+        mean=(0.48145466, 0.4578275, 0.40821073),
+        std=(0.26862954, 0.26130258, 0.27577711),
+    ),
+])
+
+
 # ─────────────────────────────────────────────
 #  TRAINING DATASET — Paired EO + SAR
 # ─────────────────────────────────────────────
@@ -145,11 +184,12 @@ class EOSARDataset(Dataset):
     Returns a dict with keys: 'eo', 'sar', 'label'
     """
 
-    def __init__(self, sar_root, eo_root, sar_transform=None, eo_transform=None):
+    def __init__(self, sar_root, eo_root, sar_transform=None, eo_transform=None, eo_drop_prob=0.0):
         self.sar_root      = sar_root
         self.eo_root       = eo_root
         self.sar_transform = sar_transform
         self.eo_transform  = eo_transform
+        self.eo_drop_prob  = eo_drop_prob  # probability of zeroing out EO (SAR-only training)
 
         self.class_to_idx = get_class_to_idx(eo_root)
         self.samples = []
@@ -187,10 +227,18 @@ class EOSARDataset(Dataset):
         if self.eo_transform:
             eo_image = self.eo_transform(eo_image)
 
+        # Modality dropout: zero out EO with eo_drop_prob (SAR always kept)
+        import random
+        eo_dropped = 0
+        if self.eo_drop_prob > 0.0 and random.random() < self.eo_drop_prob:
+            eo_image   = torch.zeros_like(eo_image)
+            eo_dropped = 1
+
         return {
-            'sar':   sar_image,
-            'eo':    eo_image,
-            'label': label
+            'sar':        sar_image,
+            'eo':         eo_image,
+            'label':      label,
+            'eo_dropped': eo_dropped,
         }
 
 
@@ -289,9 +337,11 @@ def build_dataloaders(
     train_sar_root: str,
     train_eo_root:  str,
     val_sar_root:   str,
-    val_csv_path:   str,          # ← accepts val_csv_path
-    batch_size:     int = 32,
-    num_workers:    int = 4,
+    val_csv_path:   str,
+    batch_size:     int  = 32,
+    num_workers:    int  = 4,
+    worker_init_fn       = None,   # optional: pin workers to a specific GPU
+    use_sarclip:    bool = True,   # SARCLIP INTEGRATION: use CLIP-normalized SAR transforms
 ):
     """
     Build train and val DataLoaders.
@@ -299,11 +349,20 @@ def build_dataloaders(
     Returns:
         train_loader, val_loader, class_to_idx
     """
+    # SARCLIP INTEGRATION: pick SAR transforms based on encoder type
+    if use_sarclip:
+        _sar_train_tf = sar_clip_train_transform
+        _sar_val_tf   = sar_clip_val_transform
+    else:
+        _sar_train_tf = sar_train_transform
+        _sar_val_tf   = sar_val_transform
+
     train_dataset = EOSARDataset(
         sar_root      = train_sar_root,
         eo_root       = train_eo_root,
-        sar_transform = sar_train_transform,
+        sar_transform = _sar_train_tf,
         eo_transform  = eo_train_transform,
+        eo_drop_prob  = 0.25,  # drop EO 25% of the time; SAR is always present
     )
 
     # Use the SAME class mapping from training for validation
@@ -311,7 +370,25 @@ def build_dataloaders(
         sar_root      = val_sar_root,
         csv_path      = val_csv_path,
         class_to_idx  = train_dataset.class_to_idx,   # must match training
-        sar_transform = sar_val_transform,
+        sar_transform = _sar_val_tf,
+    )
+
+    # ═══════════════════════════════════════════════════════════════
+    # Balanced sampler — inverse-frequency weights per sample
+    # Gives each of the 10 classes roughly equal representation in
+    # every batch instead of 80% sedan dominating.
+    # ═══════════════════════════════════════════════════════════════
+    labels_list   = [s[2] for s in train_dataset.samples]
+    num_classes   = len(train_dataset.class_to_idx)
+    class_counts  = torch.zeros(num_classes)
+    for lbl in labels_list:
+        class_counts[lbl] += 1
+    class_weights  = 1.0 / class_counts.clamp(min=1)          # inverse frequency
+    sample_weights = torch.tensor([class_weights[lbl].item() for lbl in labels_list])
+    sampler = WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = len(train_dataset),
+        replacement = True,
     )
 
     # ═══════════════════════════════════════════════════════════════
@@ -319,13 +396,14 @@ def build_dataloaders(
     # ═══════════════════════════════════════════════════════════════
     train_loader = DataLoader(
         train_dataset,
-        batch_size  = batch_size,
-        shuffle     = True,
-        num_workers = num_workers,
-        pin_memory  = True,              # Faster GPU transfer
-        drop_last   = True,              # Consistent batch sizes
-        persistent_workers = True,       # Keep workers alive between epochs
-        prefetch_factor    = 4,          # Prefetch 4 batches per worker
+        batch_size       = batch_size,
+        sampler          = sampler,
+        num_workers      = num_workers,
+        pin_memory       = True,
+        drop_last        = True,
+        persistent_workers = True,
+        prefetch_factor  = 4,
+        worker_init_fn   = worker_init_fn,
     )
     val_loader = DataLoader(
         val_dataset,
