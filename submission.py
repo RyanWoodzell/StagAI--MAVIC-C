@@ -43,9 +43,9 @@ SAR_WEIGHTS_PATH = r"D:\RWoodzell Classification Challenge\BestModelTryAgain\Sta
 # ─────────────────────────────────────────────
 
 CONFIG = {
-    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\SARFOUNDATIONTryModels\\best_model.pth",
+    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\#FinalTryModels\\best_model.pth",
     "test_sar_root":   "D:\\RWoodzell Classification Challenge\\test",
-    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationSubmission2BestModel",
+    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationFinalAttempt",
     "batch_size":      256,
     "num_workers":     16,
     "temperature":     1.0,

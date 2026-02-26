@@ -19,7 +19,7 @@ import zipfile
 # ─────────────────────────────────────────────
 
 CONFIG = {
-    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationSubmission2BestModel",
+    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationFinalAttempt",
     "runtime_per_image": 0.00011,   # ← from submit_inference.py output
     "uses_gpu":          0,         # 0 = GPU, 1 = CPU — you use GPU
     "extra_data":        0,         # 0 = no extra data used
