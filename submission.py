@@ -16,6 +16,7 @@ Score = Energy Score = -logsumexp(logits)
 ====================================================
 """
 
+
 import os
 import time
 import torch
@@ -24,9 +25,13 @@ import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 
-from preprocessing import sar_val_transform
+# SARCLIP INTEGRATION: use CLIP-normalized transform for inference
+from preprocessing import sar_clip_val_transform as sar_val_transform
 from encoding import ModalityEncoders
 from fusionModel import FusionModel
+
+# SARCLIP INTEGRATION
+SAR_WEIGHTS_PATH = r"D:\RWoodzell Classification Challenge\BestModelTryAgain\StagAI--MAVIC-C\sar_clip\model_configs\ViT-L-14\models--BiliSakura--SARCLIP-ViT-L-14\snapshots\fd6c03457e79e65285acf0045f63ce6bc485650f\model.safetensors"
 
 
 # ─────────────────────────────────────────────
@@ -34,9 +39,9 @@ from fusionModel import FusionModel
 # ─────────────────────────────────────────────
 
 CONFIG = {
-    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\checkpoints\\best_model.pth",
+    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\SARFOUNDATIONTryModels\\model_epoch_10.pth",
     "test_sar_root":   "D:\\RWoodzell Classification Challenge\\test",
-    "output_dir":      "D:\\RWoodzell Classification Challenge\\submission",
+    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationSubmission1",
     "batch_size":      256,
     "num_workers":     16,
     "temperature":     1.0,   # energy temperature — 1.0 is standard default
@@ -94,11 +99,20 @@ class TestDataset(Dataset):
 #  MODEL
 # ─────────────────────────────────────────────
 
+
+# SARCLIP INTEGRATION: ViT-L-14 SAR encoder, fully unfrozen at inference
 class MAVICModel(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
-        self.encoders     = ModalityEncoders(freeze_eo_backbone=False)
-        self.fusion_model = FusionModel(num_classes=num_classes)
+        self.encoders = ModalityEncoders(
+            freeze_eo_backbone  = False,
+            freeze_sar_backbone = False,
+            sar_weights_path    = SAR_WEIGHTS_PATH,
+        )
+        self.fusion_model = FusionModel(
+            num_classes = num_classes,
+            sar_in_dim  = 768,
+        )
 
     def forward(self, eo, sar):
         eo_feat, sar_feat = self.encoders(eo, sar)

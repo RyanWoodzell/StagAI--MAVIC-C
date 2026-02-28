@@ -87,7 +87,7 @@ CONFIG = {
     "train_eo_root":  "C:\\train\\EO_Train",
     "val_sar_root":   "D:\\RWoodzell Classification Challenge\\val",
     "val_csv_path":   "D:\\RWoodzell Classification Challenge\\val\\validation_reference.csv",
-    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\checkpoints",
+    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\models\\latefusion",
 
     # --- Training (Optimized for 2x RTX 6000 Ada = 95GB VRAM) ---
     "epochs":        75,
@@ -121,11 +121,18 @@ CONFIG = {
 # ─────────────────────────────────────────────
 
 def validate(model, loader, device, use_multi_gpu):
+    """
+    Returns (val_loss, val_acc, ood_auroc).
+    val_acc   — accuracy on in-distribution samples only.
+    ood_auroc — AUROC of energy score separating OOD from in-distribution.
+    """
     model.eval()
 
     total_loss    = 0.0
     total_correct = 0
     total_samples = 0
+    all_energy    = []
+    all_ood_flag  = []
 
     with torch.no_grad():
         for batch in loader:
@@ -136,7 +143,10 @@ def validate(model, loader, device, use_multi_gpu):
 
             logits = model(eo, sar)
 
-            # Only score in-distribution samples — OOD samples have label=-1
+            energy = -torch.logsumexp(logits, dim=1)
+            all_energy.append(energy.cpu())
+            all_ood_flag.append(ood_flag.cpu())
+
             in_dist_mask = (ood_flag == 0)
             if in_dist_mask.sum() == 0:
                 continue
@@ -155,9 +165,17 @@ def validate(model, loader, device, use_multi_gpu):
             total_loss    += loss.item() * in_dist_labels.size(0)
 
     if total_samples == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.5
 
-    return total_loss / total_samples, total_correct / total_samples
+    all_energy   = torch.cat(all_energy).numpy()
+    all_ood_flag = torch.cat(all_ood_flag).numpy()
+    try:
+        from sklearn.metrics import roc_auc_score
+        ood_auroc = roc_auc_score(all_ood_flag, all_energy)
+    except Exception:
+        ood_auroc = 0.5
+
+    return total_loss / total_samples, total_correct / total_samples, ood_auroc
 
 
 def train(config: dict):
@@ -264,14 +282,15 @@ def train(config: dict):
 
     # --- Checkpointing ---
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
-    best_val_acc   = 0.0
+    best_combined  = 0.0
     best_ckpt_path = os.path.join(config["checkpoint_dir"], "best_model.pth")
+    ood_weight     = 0.25   # 75% classification, 25% OOD — matches competition scoring
 
     # --- Training Loop ---
-    print("=" * 70)
+    print("=" * 85)
     print(f"{'Epoch':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
-          f"{'Val Loss':>8} | {'Val Acc':>7} | {'LR':>8}")
-    print("=" * 70)
+          f"{'Val Loss':>8} | {'Val Acc':>7} | {'OOD AUROC':>9} | {'LR':>8}")
+    print("=" * 85)
 
     for epoch in range(1, config["epochs"] + 1):
 
@@ -311,9 +330,8 @@ def train(config: dict):
         train_acc  = total_correct / total_samples
 
         # --- Validate ---
-        val_loss, val_acc = validate(model, val_loader, device, use_multi_gpu)
-
-        # OneCycleLR steps per batch, not per epoch
+        val_loss, val_acc, ood_auroc = validate(model, val_loader, device, use_multi_gpu)
+        combined   = (1.0 - ood_weight) * val_acc + ood_weight * ood_auroc
         current_lr = scheduler.get_last_lr()[0]
 
         print(
@@ -322,25 +340,38 @@ def train(config: dict):
             f"{train_acc*100:>8.2f}% | "
             f"{val_loss:>8.4f} | "
             f"{val_acc*100:>6.2f}% | "
+            f"{ood_auroc:>9.4f} | "
             f"{current_lr:>8.2e}"
         )
 
-        # Save best checkpoint — unwrap DataParallel before saving
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        def make_ckpt():
             state = model.module if use_multi_gpu else model
-            torch.save({
+            return {
                 "epoch":        epoch,
                 "model_state":  state.state_dict(),
                 "optimizer":    optimizer.state_dict(),
                 "scheduler":    scheduler.state_dict(),
                 "val_acc":      val_acc,
+                "ood_auroc":    ood_auroc,
+                "combined":     combined,
                 "class_to_idx": class_to_idx,
-            }, best_ckpt_path)
-            print(f"         ✅ New best saved (val acc: {val_acc*100:.2f}%)")
+            }
 
-    print("=" * 70)
-    print(f"Training complete. Best val accuracy: {best_val_acc*100:.2f}%")
+        # Save every 5 epochs
+        if epoch % 5 == 0:
+            periodic_path = os.path.join(config["checkpoint_dir"], f"epoch_{epoch:03d}.pth")
+            torch.save(make_ckpt(), periodic_path)
+            print(f"         📁 Periodic save → epoch_{epoch:03d}.pth")
+
+        # Save best checkpoint
+        if combined > best_combined:
+            best_combined = combined
+            torch.save(make_ckpt(), best_ckpt_path)
+            print(f"         ✅ New best saved "
+                  f"(acc: {val_acc*100:.2f}%  auroc: {ood_auroc:.4f}  combined: {combined:.4f})")
+
+    print("=" * 85)
+    print(f"Training complete. Best combined score: {best_combined:.4f}")
     print(f"Best model saved to: {best_ckpt_path}")
     return best_ckpt_path
 

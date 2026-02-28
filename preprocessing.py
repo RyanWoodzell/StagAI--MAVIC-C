@@ -111,13 +111,36 @@ sar_val_transform = transforms.Compose([
 #  TRAINING DATASET — Paired EO + SAR
 # ─────────────────────────────────────────────
 
+# Official MAVIC-C competition class ordering.
+# Hardcoded so training IDs always match submission IDs — no remapping needed.
+COMPETITION_CLASS_TO_IDX = {
+    "sedan":                  0,
+    "SUV":                    1,
+    "pickup_truck":           2,
+    "van":                    3,
+    "box_truck":              4,
+    "motorcycle":             5,
+    "flatbed_truck":          6,
+    "bus":                    7,
+    "pickup_truck_w_trailer": 8,
+    "semi_w_trailer":         9,
+}
+
+
 def get_class_to_idx(root):
-    """Map class folder names → integer indices (sorted for consistency)."""
-    classes = sorted([
-        d for d in os.listdir(root)
-        if os.path.isdir(os.path.join(root, d))
-    ])
-    return {cls: i for i, cls in enumerate(classes)}
+    """
+    Returns the competition-fixed class→index mapping.
+    Validates that every folder in `root` appears in the competition list
+    so misnamed folders are caught immediately at startup.
+    """
+    found = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    unknown = [c for c in found if c not in COMPETITION_CLASS_TO_IDX]
+    if unknown:
+        raise ValueError(
+            f"Folders not in competition class list: {unknown}\n"
+            f"Expected: {list(COMPETITION_CLASS_TO_IDX.keys())}"
+        )
+    return COMPETITION_CLASS_TO_IDX
 
 
 class EOSARDataset(Dataset):
