@@ -94,16 +94,16 @@ CONFIG = {
     "train_eo_root":  "C:\\train\\EO_Train",
     "val_sar_root":   "D:\\RWoodzell Classification Challenge\\val",
     "val_csv_path":   "D:\\RWoodzell Classification Challenge\\val\\validation_reference.csv",
-    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\#FinalTryModels",
+    "checkpoint_dir": "D:\\RWoodzell Classification Challenge\\##SARCLIPv2",
 
     # --- Training (Optimized for 2x RTX 6000 Ada = 95GB VRAM) ---
-    "epochs":        75,
+    "epochs":        100,
     "batch_size":    512,           
     # Optimized for NVMe SSD; reduce to 4 if still on HDD
     "num_workers":   16,            # 64 cores - leave room for GPU threads
     "prefetch_factor": 4,           # Prefetch batches per worker
     
-    "learning_rate": 3e-4,          # Higher LR with larger batch + OneCycleLR
+    "learning_rate": 2e-4,          # Slightly lower for stable SARCLIP fine-tuning
     "weight_decay":  1e-4,
     "warmup_pct":    0.1,           # 10% warmup epochs
 
@@ -116,7 +116,8 @@ CONFIG = {
     "freeze_sar_backbone": True,
     "sar_weights_path":    r"D:\RWoodzell Classification Challenge\BestModelTryAgain\StagAI--MAVIC-C\sar_clip\model_configs\ViT-L-14\models--BiliSakura--SARCLIP-ViT-L-14\snapshots\fd6c03457e79e65285acf0045f63ce6bc485650f\model.safetensors",
     "sar_in_dim":          768,
-    "sar_unfreeze_epoch":   65,   
+    "sar_unfreeze_epoch":  10,      # Unfreeze early — 90 epochs of SARCLIP fine-tuning
+    "eo_drop_prob":        0.80,    # 80% SAR-only batches — matches SAR-only test condition
 
     # --- Hardware (RTX 6000 Ada Optimizations) ---
     "use_multi_gpu":   False,
@@ -215,6 +216,7 @@ def train(config: dict):
         val_csv_path   = config["val_csv_path"],
         batch_size     = config["batch_size"],
         num_workers    = config["num_workers"],
+        eo_drop_prob   = config.get("eo_drop_prob", 0.25),
     )
 
     num_classes = len(class_to_idx)
@@ -298,16 +300,32 @@ def train(config: dict):
             m = model.module if use_multi_gpu else model
             for param in m.encoders.sar_encoder.backbone.parameters():
                 param.requires_grad = True
-            print(f"\n🔓 Epoch {epoch}: SARCLIP backbone unfrozen for fine-tuning")
+            print(f"\nEpoch {epoch}: SARCLIP backbone unfrozen for fine-tuning")
 
-            # Reset optimizer so newly unfrozen params get proper learning rate
+            # Differential LR: backbone gets 100x lower LR to preserve SARCLIP features
+            backbone_ids    = {id(p) for p in m.encoders.sar_encoder.backbone.parameters()}
+            backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
+            other_params    = [p for p in model.parameters() if id(p) not in backbone_ids and p.requires_grad]
+            backbone_lr     = config["learning_rate"] * 0.01   # 2e-6 — very slow backbone
+            other_lr        = config["learning_rate"] * 0.1    # 2e-5 — faster for head/projectors
+
             optimizer = AdamW(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr           = config["learning_rate"] * 0.1,
+                [{"params": backbone_params, "lr": backbone_lr},
+                 {"params": other_params,    "lr": other_lr}],
                 weight_decay = config["weight_decay"],
                 fused        = torch.cuda.is_available(),
             )
-            print(f"   Optimizer reset with fine-tune lr: {config['learning_rate'] * 0.1:.2e}")
+            remaining_steps = (config["epochs"] - epoch + 1) * steps_per_epoch
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr          = [backbone_lr, other_lr],
+                total_steps     = remaining_steps,
+                pct_start       = 0.05,
+                anneal_strategy = 'cos',
+                div_factor      = 5.0,
+                final_div_factor= 1e3,
+            )
+            print(f"   Backbone LR: {backbone_lr:.2e}, Head/Projector LR: {other_lr:.2e}")
 
         # --- Train ---
         model.train()

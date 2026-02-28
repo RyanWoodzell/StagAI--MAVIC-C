@@ -191,7 +191,7 @@ class FusionModel(nn.Module):
     def __init__(
         self,
         num_classes:  int   = 10,
-        proj_dim:     int   = 256,
+        proj_dim:     int   = 512,
         drop_prob:    float = 0.25,
         head_dropout: float = 0.4,
         label_smooth: float = 0.1,

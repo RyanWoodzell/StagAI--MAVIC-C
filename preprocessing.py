@@ -124,9 +124,11 @@ sar_clip_train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomCrop(224),
     transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),           # SAR has no canonical up orientation
+    transforms.RandomRotation(degrees=15, fill=0),  # rotation robustness
     transforms.ToTensor(),
     SARLogTransform(eps=1e-6),
-    ExpandChannels(),   # [1,H,W] → [3,H,W]
+    ExpandChannels(),   # [1,H,W] -> [3,H,W]
     transforms.Normalize(
         mean=(0.48145466, 0.4578275, 0.40821073),
         std=(0.26862954, 0.26130258, 0.27577711),
@@ -342,6 +344,7 @@ def build_dataloaders(
     num_workers:    int  = 4,
     worker_init_fn       = None,   # optional: pin workers to a specific GPU
     use_sarclip:    bool = True,   # SARCLIP INTEGRATION: use CLIP-normalized SAR transforms
+    eo_drop_prob:   float = 0.25,  # probability of zeroing EO per sample (SAR-only training)
 ):
     """
     Build train and val DataLoaders.
@@ -362,7 +365,7 @@ def build_dataloaders(
         eo_root       = train_eo_root,
         sar_transform = _sar_train_tf,
         eo_transform  = eo_train_transform,
-        eo_drop_prob  = 0.25,  # drop EO 25% of the time; SAR is always present
+        eo_drop_prob  = eo_drop_prob,
     )
 
     # Use the SAME class mapping from training for validation

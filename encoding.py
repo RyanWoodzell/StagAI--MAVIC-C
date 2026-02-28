@@ -24,6 +24,7 @@ from torchvision.models import (
 
 # SARCLIP INTEGRATION
 import sys
+import logging
 sys.path.insert(0, r'D:\RWoodzell Classification Challenge\BestModelTryAgain\SARCLIP')
 import open_clip
 from safetensors.torch import load_file
@@ -140,36 +141,37 @@ class SARCLIPEncoder(nn.Module):
     def __init__(self, weights_path: str, freeze_backbone: bool = True):
         super().__init__()
 
-    # Create ViT-L-14 architecture (no pretrained weights yet)
+        # Create ViT-L-14 architecture — suppress the "no pretrained weights" log from open_clip
+        _root_logger = logging.getLogger()
+        _prev_level  = _root_logger.level
+        _root_logger.setLevel(logging.ERROR)
         model, _, _ = open_clip.create_model_and_transforms('ViT-L-14', pretrained=None)
+        _root_logger.setLevel(_prev_level)
 
-    # Load .safetensors weights from HuggingFace
+        # Load safetensors weights — keys are open_clip format under vision_model.* prefix
         state_dict = load_file(weights_path)
-
-    # Remap HuggingFace keys → open_clip keys
         remapped = {}
         for k, v in state_dict.items():
             if k.startswith('vision_model.'):
-                new_key = k.replace('vision_model.', 'visual.')
-                remapped[new_key] = v
+                remapped[k.replace('vision_model.', 'visual.')] = v
             elif k == 'logit_scale':
                 remapped[k] = v
-    # Load remapped weights (strict=False: text tower keys will be missing)
+
+        # strict=False: text tower keys are absent (intentional — we only use visual)
         missing, unexpected = model.load_state_dict(remapped, strict=False)
+        # Verify all visual weights loaded (only text tower should be missing)
+        visual_missing = [k for k in missing if k.startswith('visual.')]
+        if visual_missing:
+            raise RuntimeError(f"SARCLIP visual weights failed to load: {visual_missing[:5]}")
+        print(f"[OK] SARCLIP ViT-L-14 loaded - visual keys: {len(remapped)-1}, text missing (expected): {len(missing)}")
 
-    # ← PRINT STATEMENTS GO HERE, after load_state_dict
-        print(f"✅ SARCLIP ViT-L-14 loaded — missing: {len(missing)}, unexpected: {len(unexpected)}")
-        print(f"   Remapped {len(remapped)} keys from weights file")
-        # Freeze if requested (default: True — SARCLIP is already pretrained)
+        self.backbone    = model.visual  # ViT-L-14 visual encoder
+        self.feature_dim = 768           # ViT-L-14 outputs 768-dim features
 
-        self.backbone = model.visual  # ViT-L-14 visual encoder
-        self.feature_dim = 768  # ViT-L-14 outputs 768-dim features
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
-            print("🔒 SARCLIP backbone frozen")
-
-        self.feature_dim = 768
+            print("[FROZEN] SARCLIP backbone frozen")
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Expand to 3 channels only if input is single-channel

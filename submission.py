@@ -43,9 +43,9 @@ SAR_WEIGHTS_PATH = r"D:\RWoodzell Classification Challenge\BestModelTryAgain\Sta
 # ─────────────────────────────────────────────
 
 CONFIG = {
-    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\#FinalTryModels\\best_model.pth",
+    "checkpoint_path": "D:\\RWoodzell Classification Challenge\\##SARCLIPv2\\best_model.pth",
     "test_sar_root":   "D:\\RWoodzell Classification Challenge\\test",
-    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARFoundationFinalAttempt",
+    "output_dir":      "D:\\RWoodzell Classification Challenge\\Submissions\\SARCLIPv2Submission1",
     "batch_size":      256,
     "num_workers":     16,
     "temperature":     1.0,
@@ -237,16 +237,16 @@ def run_inference(config: dict):
             total_time   += (t_end - t_start)
             total_images += sar.size(0)
 
-            pred_class    = logits.argmax(dim=1)
+            pred_class   = logits.argmax(dim=1)
             import torch.nn.functional as F
-            probs         = F.softmax(logits, dim=1)
-            softmax_score = probs.max(dim=1).values
+            # Energy score: more negative = more in-distribution (better AUROC than softmax)
+            energy_score = compute_energy(logits, config["temperature"])
 
             for i in range(len(image_ids)):
                 results.append({
                     "image_id": image_ids[i],
                     "class_id": pred_class[i].item(),
-                    "score":    round(softmax_score[i].item(), 6),
+                    "score":    round(energy_score[i].item(), 6),
                 })
 
     runtime_per_image = total_time / total_images
